@@ -1,0 +1,58 @@
+# GitHub Actions workflow — save this as .github/workflows/post-alerts.yml
+# in your repo (the .github/workflows/ path is required by GitHub; it's kept
+# flat here only because this tool can't create dotfolders directly).
+#
+# Runs the bot every 10 minutes, then commits the updated state.json back to
+# the repo so the next run knows where it left off (GitHub Actions runners
+# are ephemeral — nothing persists unless you commit it).
+#
+# Setup:
+#   1. Push this repo (mcpd_crime_bot.py, requirements.txt, this workflow) to
+#      a GitHub repo. Private repos are fine — 2,000 free Action minutes/month
+#      easily covers a 10-min cron (~30 min/month used).
+#   2. In repo Settings > Secrets and variables > Actions, add secrets:
+#      X_API_KEY, X_API_SECRET, X_ACCESS_TOKEN, X_ACCESS_SECRET,
+#      and optionally SOCRATA_APP_TOKEN.
+#   3. Do NOT gitignore state.json for this deployment — it needs to be
+#      committed so state survives between runs. Remove it from .gitignore,
+#      or create an empty {"last_start_time": null, "seen_ids": []} state.json
+#      and commit it once to start.
+
+name: Post MCPD crime alerts
+
+on:
+  schedule:
+    - cron: "*/10 * * * *"   # every 10 minutes (GitHub may delay slightly under load)
+  workflow_dispatch: {}       # lets you trigger a manual run from the Actions tab
+
+permissions:
+  contents: write
+
+jobs:
+  post-alerts:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - run: pip install -r requirements.txt
+
+      - name: Run bot
+        env:
+          X_API_KEY: ${{ secrets.X_API_KEY }}
+          X_API_SECRET: ${{ secrets.X_API_SECRET }}
+          X_ACCESS_TOKEN: ${{ secrets.X_ACCESS_TOKEN }}
+          X_ACCESS_SECRET: ${{ secrets.X_ACCESS_SECRET }}
+          SOCRATA_APP_TOKEN: ${{ secrets.SOCRATA_APP_TOKEN }}
+        run: python mcpd_crime_bot.py
+
+      - name: Commit updated state
+        run: |
+          git config user.name "mcpd-crime-bot"
+          git config user.email "actions@users.noreply.github.com"
+          git add state.json
+          git diff --quiet --cached || git commit -m "Update bot state [skip ci]"
+          git push
