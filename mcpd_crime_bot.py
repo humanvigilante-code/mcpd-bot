@@ -206,7 +206,7 @@ def main(dry_run: bool = False):
     state = load_state()
 
     if state.get("last_start_time") is None:
-        cutoff = datetime.utcnow() - timedelta(hours=INITIAL_LOOKBACK_HOURS)
+        cutoff = datetime.now(timezone.utc) - timedelta(hours=INITIAL_LOOKBACK_HOURS)
         state["last_start_time"] = cutoff.strftime("%Y-%m-%dT%H:%M:%S.000")
         log.info(
             "No prior state found — starting from a %d-hour lookback (%s) "
