@@ -1,3 +1,4 @@
-requests>=2.31
 tweepy>=4.14
 python-dotenv>=1.0
+staticmap>=0.5.7
+Pillow>=10.1
