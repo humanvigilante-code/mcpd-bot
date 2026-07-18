@@ -109,14 +109,57 @@ MAP_ZOOM = 16             # higher = more zoomed in / more legible street detail
 MAP_TILE_URL = "https://a.tile.openstreetmap.org/{z}/{x}/{y}.png"
 MAP_USER_AGENT = "mcpd-crime-bot/1.0 (personal public-safety alert bot)"
 TOP_BANNER_HEIGHT = 80     # incident type/time annotation bar
-BOTTOM_LEGEND_HEIGHT = 150  # nearby-incidents text legend
+LEGEND_LINE_HEIGHT = 24     # per nearby-incident legend row
+LEGEND_HEADER_HEIGHT = 34   # legend title row above the list
 
-# Nearby-incident annotation: shows recent-area context (orange markers +
-# a text legend) alongside the main incident (red marker). Just an extra
-# free Socrata read per post — no added cost, only extra latency.
+# Nearby-incident annotation: shows recent-area context (colored markers +
+# a matching text legend) alongside the main incident (red marker). Just an
+# extra free Socrata read per post — no added cost, only extra latency.
+# Only genuinely serious nearby incidents are shown (same filter as the main
+# alert), over a longer lookback since "nearby history" is meant to span
+# further back than "what just happened."
 NEARBY_RADIUS_METERS = 500
-NEARBY_LOOKBACK_DAYS = 30
-NEARBY_MAX_ANNOTATED = 5
+NEARBY_LOOKBACK_DAYS = 365
+NEARBY_MAX_ANNOTATED = 10
+NEARBY_FETCH_LIMIT = 200    # raw records pulled before filtering to serious types
+
+# Main incident: red, full size. Nearby incidents: orange, half size — shape
+# is what distinguishes one nearby cluster from another, not color, since
+# every nearby marker uses the same orange.
+MAIN_MARKER_COLOR = "#e8342a"
+MAIN_MARKER_SIZE = 20
+NEARBY_MARKER_COLOR = "#ff9900"
+NEARBY_MARKER_SIZE = MAIN_MARKER_SIZE // 2
+
+# Nearby incidents within this distance of EACH OTHER, or of the main
+# incident itself, are treated as "the same place" and share one marker
+# style instead of each getting its own — a repeated shape reappearing is
+# meant to read as "this spot keeps coming up," not as visual noise from
+# assigning unique styles to points that are really on top of each other.
+# ~0.05 mi ≈ 260 ft, roughly a city block — small enough to mean "same
+# building/corner," not "same neighborhood."
+SAME_LOCATION_THRESHOLD_MILES = 0.05
+
+# Reserved shape for nearby incidents essentially at the main incident's own
+# location, so it reads as its own category ("happened right here before")
+# and never collides with a regular cluster's shape — "circle" is excluded
+# from the rotation below for exactly that reason.
+AT_SCENE_STYLE = ("circle", NEARBY_MARKER_COLOR)
+
+# Distinct shape per *cluster* of nearby incidents (color is constant now,
+# so shape alone tells clusters apart). "circle" is deliberately left out —
+# it's reserved for AT_SCENE_STYLE above.
+NEARBY_MARKER_SHAPES = [
+    "square",
+    "triangle",
+    "diamond",
+    "plus",
+    "x",
+    "asterisk",
+    "pentagon",
+    "hexagon",
+    "inverted_triangle",
+]
 
 # ---------------------------------------------------------------------------
 
@@ -201,10 +244,11 @@ def fetch_new_incidents(last_start_time: str | None) -> list[dict]:
 
 
 def fetch_nearby_incidents(lat: float, lon: float, before_time: str, exclude_id: str | None = None) -> list[dict]:
-    """Historical incidents within NEARBY_RADIUS_METERS of (lat, lon), in the
-    NEARBY_LOOKBACK_DAYS before `before_time`. Used to give map viewers area
-    context. Best-effort: callers should treat a raised exception as "no
-    nearby data available" and fall back gracefully."""
+    """Serious-category historical incidents (same filter as the main alert)
+    within NEARBY_RADIUS_METERS of (lat, lon), in the NEARBY_LOOKBACK_DAYS
+    before `before_time`, capped at NEARBY_MAX_ANNOTATED (most recent first).
+    Used to give map viewers area context. Best-effort: callers should treat
+    a raised exception as "no nearby data available" and fall back gracefully."""
     where = f"within_circle(geolocation, {lat}, {lon}, {NEARBY_RADIUS_METERS}) AND start_time < '{before_time}'"
     try:
         cutoff = datetime.fromisoformat(before_time) - timedelta(days=NEARBY_LOOKBACK_DAYS)
@@ -215,11 +259,15 @@ def fetch_nearby_incidents(lat: float, lon: float, before_time: str, exclude_id:
     params = {
         "$where": where,
         "$order": "start_time DESC",
-        "$limit": NEARBY_MAX_ANNOTATED + 3,  # small buffer in case exclude_id shows up
+        # Fetch a much larger raw pool than we'll show, since most dispatch
+        # types (alarms, traffic, disturbances, etc.) get discarded by the
+        # matches_filter() pass below — only serious ones are kept.
+        "$limit": NEARBY_FETCH_LIMIT,
     }
     results = _socrata_get(params)
     if exclude_id:
         results = [r for r in results if r.get("incident_id") != exclude_id]
+    results = [r for r in results if matches_filter(r)]
     return results[:NEARBY_MAX_ANNOTATED]
 
 
@@ -292,6 +340,80 @@ def _distance_miles(lat1: float, lon1: float, lat2: float, lon2: float) -> float
     return 2 * r * math.asin(math.sqrt(a))
 
 
+def _lonlat_to_px(lon: float, lat: float, zoom: int, x_center: float, y_center: float,
+                   width: int, height: int, tile_size: int = 256) -> tuple[float, float]:
+    """Same Web Mercator tile-space projection staticmap uses internally to
+    place its own markers, replicated here (rather than reaching into
+    staticmap's private API) so we can draw custom shapes at the exact pixel
+    spot a marker at (lon, lat) would land, after the map has been rendered
+    centered/zoomed around the main incident."""
+    x = ((lon + 180.0) / 360.0) * (2 ** zoom)
+    y = (1 - math.log(math.tan(lat * math.pi / 180) + 1 / math.cos(lat * math.pi / 180)) / math.pi) / 2 * (2 ** zoom)
+    px = (x - x_center) * tile_size + width / 2
+    py = (y - y_center) * tile_size + height / 2
+    return px, py
+
+
+def _draw_shape(draw: "ImageDraw.ImageDraw", shape: str, cx: float, cy: float, size: float, color: str) -> None:
+    """Draws one of several distinct marker shapes centered at (cx, cy). Each
+    draws a white halo first for contrast against whatever's underneath
+    (map tiles of varying color, or the light legend background)."""
+    s = size
+    halo = "white"
+
+    def poly(points, w=2):
+        draw.polygon(points, fill=color, outline=halo, width=w)
+
+    if shape == "square":
+        draw.rectangle([cx - s, cy - s, cx + s, cy + s], fill=color, outline=halo, width=2)
+    elif shape == "triangle":
+        poly([(cx, cy - s * 1.15), (cx + s * 1.05, cy + s * 0.85), (cx - s * 1.05, cy + s * 0.85)])
+    elif shape == "inverted_triangle":
+        poly([(cx, cy + s * 1.15), (cx + s * 1.05, cy - s * 0.85), (cx - s * 1.05, cy - s * 0.85)])
+    elif shape == "diamond":
+        poly([(cx, cy - s * 1.2), (cx + s * 1.2, cy), (cx, cy + s * 1.2), (cx - s * 1.2, cy)])
+    elif shape == "pentagon":
+        pts = [
+            (cx + s * 1.15 * math.cos(math.radians(-90 + i * 72)),
+             cy + s * 1.15 * math.sin(math.radians(-90 + i * 72)))
+            for i in range(5)
+        ]
+        poly(pts)
+    elif shape == "hexagon":
+        pts = [
+            (cx + s * 1.1 * math.cos(math.radians(i * 60)),
+             cy + s * 1.1 * math.sin(math.radians(i * 60)))
+            for i in range(6)
+        ]
+        poly(pts)
+    elif shape == "plus":
+        w = s * 0.5
+        draw.rectangle([cx - w - 2, cy - s * 1.2 - 2, cx + w + 2, cy + s * 1.2 + 2], fill=halo)
+        draw.rectangle([cx - s * 1.2 - 2, cy - w - 2, cx + s * 1.2 + 2, cy + w + 2], fill=halo)
+        draw.rectangle([cx - w, cy - s * 1.2, cx + w, cy + s * 1.2], fill=color)
+        draw.rectangle([cx - s * 1.2, cy - w, cx + s * 1.2, cy + w], fill=color)
+    elif shape == "x":
+        lw = max(3, int(s * 0.5))
+        for dx, dy in [(1, 1), (1, -1)]:
+            draw.line([(cx - s * 1.1 * dx, cy - s * 1.1 * dy), (cx + s * 1.1 * dx, cy + s * 1.1 * dy)],
+                      fill=halo, width=lw + 4)
+        for dx, dy in [(1, 1), (1, -1)]:
+            draw.line([(cx - s * 1.1 * dx, cy - s * 1.1 * dy), (cx + s * 1.1 * dx, cy + s * 1.1 * dy)],
+                      fill=color, width=lw)
+    elif shape == "asterisk":
+        lw = max(3, int(s * 0.35))
+        for ang_deg in (0, 60, 120):
+            ang = math.radians(ang_deg)
+            dx, dy = math.cos(ang) * s * 1.25, math.sin(ang) * s * 1.25
+            draw.line([(cx - dx, cy - dy), (cx + dx, cy + dy)], fill=halo, width=lw + 4)
+        for ang_deg in (0, 60, 120):
+            ang = math.radians(ang_deg)
+            dx, dy = math.cos(ang) * s * 1.25, math.sin(ang) * s * 1.25
+            draw.line([(cx - dx, cy - dy), (cx + dx, cy + dy)], fill=color, width=lw)
+    else:  # "circle" and any unrecognized shape name
+        draw.ellipse([cx - s, cy - s, cx + s, cy + s], fill=color, outline=halo, width=2)
+
+
 def _load_font(size: int) -> "ImageFont.FreeTypeFont":
     """Tries common bold font paths on macOS and the Ubuntu GitHub Actions
     runner, falling back to PIL's built-in bitmap font if none are found."""
@@ -321,35 +443,72 @@ def generate_map_image(
 ) -> str:
     """Renders a map with a red marker at (latitude, longitude), an optional
     top banner annotating the incident type/time, and — if `nearby` incidents
-    are passed in — smaller orange markers plus a text legend at the bottom
-    giving each one's type, time, and distance. Saves to a temp PNG and
-    returns the file path; caller is responsible for deleting it after use."""
+    are passed in — a distinctly shaped-and-colored marker per nearby
+    incident plus a matching legend at the bottom (type, time, distance).
+    Saves to a temp PNG and returns the file path; caller must delete it
+    after use.
+
+    Only the main incident is added as a staticmap marker (so the map is
+    always centered exactly on it); nearby markers are drawn afterward with
+    PIL at their correctly projected pixel positions, since staticmap's own
+    marker types don't support shapes beyond circles/icons."""
     if StaticMap is None:
         raise RuntimeError("staticmap is not installed. Run: pip install staticmap")
 
     m = StaticMap(*MAP_SIZE, url_template=MAP_TILE_URL, headers={"User-Agent": MAP_USER_AGENT})
-
-    valid_nearby = []
-    for nb in nearby or []:
-        try:
-            nb_lat, nb_lon = float(nb.get("latitude", 0)), float(nb.get("longitude", 0))
-        except (TypeError, ValueError):
-            continue
-        if nb_lat and nb_lon:
-            valid_nearby.append((nb, nb_lat, nb_lon))
-            m.add_marker(CircleMarker((nb_lon, nb_lat), "#ff9900", 11))
-
-    m.add_marker(CircleMarker((longitude, latitude), "#e8342a", 20))
+    m.add_marker(CircleMarker((longitude, latitude), MAIN_MARKER_COLOR, MAIN_MARKER_SIZE))
 
     map_image = m.render(zoom=MAP_ZOOM).convert("RGB")
     map_w, map_h = map_image.size
 
+    # Cluster nearby incidents by location before assigning styles: anything
+    # within SAME_LOCATION_THRESHOLD_MILES of the main incident gets the
+    # reserved AT_SCENE_STYLE; anything within that same distance of an
+    # already-seen nearby cluster joins that cluster's style; only a genuinely
+    # new location gets the next unused (shape, color) from the palettes.
+    valid_nearby = []
+    clusters = []  # [{"lat": float, "lon": float, "style": (shape, color)}, ...]
+    next_style_idx = 0
+    for nb in (nearby or []):
+        try:
+            nb_lat, nb_lon = float(nb.get("latitude", 0)), float(nb.get("longitude", 0))
+        except (TypeError, ValueError):
+            continue
+        if not (nb_lat and nb_lon):
+            continue
+
+        if _distance_miles(latitude, longitude, nb_lat, nb_lon) <= SAME_LOCATION_THRESHOLD_MILES:
+            shape, color = AT_SCENE_STYLE
+        else:
+            match = next(
+                (c for c in clusters if _distance_miles(c["lat"], c["lon"], nb_lat, nb_lon) <= SAME_LOCATION_THRESHOLD_MILES),
+                None,
+            )
+            if match:
+                shape, color = match["style"]
+            else:
+                shape = NEARBY_MARKER_SHAPES[next_style_idx % len(NEARBY_MARKER_SHAPES)]
+                color = NEARBY_MARKER_COLOR
+                clusters.append({"lat": nb_lat, "lon": nb_lon, "style": (shape, color)})
+                next_style_idx += 1
+
+        valid_nearby.append((nb, nb_lat, nb_lon, shape, color))
+
     top_h = TOP_BANNER_HEIGHT if incident_type else 0
-    bottom_h = BOTTOM_LEGEND_HEIGHT if valid_nearby else 0
+    bottom_h = (LEGEND_HEADER_HEIGHT + len(valid_nearby) * LEGEND_LINE_HEIGHT + 10) if valid_nearby else 0
 
     canvas = Image.new("RGB", (map_w, top_h + map_h + bottom_h), "white")
     canvas.paste(map_image, (0, top_h))
     draw = ImageDraw.Draw(canvas)
+
+    # Draw nearby shapes on the map now that they're pasted at their real
+    # offset (top_h). Points that fall outside the visible map area (rare,
+    # since NEARBY_RADIUS_METERS is small relative to the zoom level) are
+    # simply skipped on the map but still listed in the legend below.
+    for nb, nb_lat, nb_lon, shape, color in valid_nearby:
+        px, py = _lonlat_to_px(nb_lon, nb_lat, m.zoom, m.x_center, m.y_center, map_w, map_h)
+        if 0 <= px <= map_w and 0 <= py <= map_h:
+            _draw_shape(draw, shape, px, py + top_h, NEARBY_MARKER_SIZE, color)
 
     if incident_type:
         draw.rectangle([0, 0, map_w, top_h], fill="#8b1a1a")
@@ -362,19 +521,21 @@ def generate_map_image(
         draw.rectangle([0, y0, map_w, y0 + bottom_h], fill="#f2f2f2")
         draw.text(
             (14, y0 + 8),
-            f"Nearby dispatches, last {NEARBY_LOOKBACK_DAYS} days (orange markers):",
+            f"Nearby serious incidents, last {NEARBY_LOOKBACK_DAYS} days "
+            f"(shapes match map markers; repeated shape = same location):",
             font=_load_font(16), fill="#333333",
         )
-        y = y0 + 32
-        for nb, nb_lat, nb_lon in valid_nearby:
+        y = y0 + LEGEND_HEADER_HEIGHT
+        for nb, nb_lat, nb_lon, shape, color in valid_nearby:
             dist = _distance_miles(latitude, longitude, nb_lat, nb_lon)
             try:
-                nb_time = datetime.fromisoformat(nb["start_time"]).strftime("%b %d, %I:%M %p")
+                nb_time = datetime.fromisoformat(nb["start_time"]).strftime("%b %d, %Y, %I:%M %p")
             except Exception:
                 nb_time = nb.get("start_time", "")
-            label = f"• {nb.get('initial_type', 'Incident').title()[:38]} — {nb_time} ({dist:.1f} mi)"
-            draw.text((20, y), label, font=_load_font(15), fill="#333333")
-            y += 22
+            _draw_shape(draw, shape, 27, y + 9, NEARBY_MARKER_SIZE - 1, color)
+            label = f"{nb.get('initial_type', 'Incident').title()[:45]} — {nb_time} ({dist:.1f} mi)"
+            draw.text((44, y), label, font=_load_font(15), fill="#333333")
+            y += LEGEND_LINE_HEIGHT
 
     fd, path = tempfile.mkstemp(suffix=".png", prefix="mcpd_map_")
     os.close(fd)

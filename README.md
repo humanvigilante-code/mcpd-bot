@@ -50,6 +50,10 @@ and check `disposition_desc` instead — I can make that change if you want it.
   of Feb 2026) — you'll need to add a payment method and buy credits in the
   [Developer Console](https://console.x.com). Set a **spending limit** there
   so costs can't run away.
+  
+- Callback URI / Redirect URL(required): https://x.com
+- Website URL: https://github.com/humanvigilante-code/mcpd-bot
+
 
 ### 2. Install and configure
 
